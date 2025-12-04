@@ -384,7 +384,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return
 
-
     # Home
     if data == "home":
         await query.edit_message_text("🏠 Back to home:", reply_markup=home_keyboard(context))
@@ -729,3 +728,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+def main_webhook():
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        webhook_url="https://barber-bot-new.onrender.com/webhook"
+    )
