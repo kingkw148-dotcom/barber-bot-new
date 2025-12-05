@@ -4,7 +4,6 @@ import os
 import re
 from datetime import datetime, timedelta, time as dtime
 from urllib.parse import quote_plus, unquote_plus
-ADMIN_CHAT_ID = 6535793206  # 🔥 Replace with your actual Telegram user ID
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -17,30 +16,29 @@ from telegram.ext import (
     filters,
 )
 
-# -----------------------
-# Configuration & logging
-# -----------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 load_dotenv()
 
+# -----------------------
+# Config
+# -----------------------
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     print("❌ BOT_TOKEN not found in .env, using fallback...")
-    TOKEN = "8214171683:AAE-ZgPUtZE8xGRBFM0s_LeaWtzLN7eu74E"  # fallback
+    TOKEN = "8214171683:AAE-ZgPUtZE8xGRBFM0s_LeaWtzLN7eu74E"  # fallback for local dev
 
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "6535793206"))
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                    level=logging.INFO)
+
+# Global application variable (will be set by main_webhook or main)
+application = None
 
 # -----------------------
 # Global storage (simple)
 # -----------------------
-# reservations: user_id -> reservation dict (persist only in memory)
-reservations = {}
-booking_history = {}  # user_id -> list of all bookings (active, cancelled, completed)
+reservations = {}     # user_id -> reservation dict
+booking_history = {}  # user_id -> list of bookings (mirrors application.bot_data booking_history)
 
 # -----------------------
 # Slot generation helpers
@@ -48,14 +46,10 @@ booking_history = {}  # user_id -> list of all bookings (active, cancelled, comp
 SLOT_INTERVAL_MINUTES = 40
 OPEN_TIME_STR = "08:00 AM"
 CLOSE_TIME_STR = "08:00 PM"
-RECOMMEND_LIMIT = 5  # how many suggestions to return
+RECOMMEND_LIMIT = 5
 
 
 def generate_slots_for_date(date_str_iso):
-    """
-    date_str_iso: 'YYYY-MM-DD'
-    returns list of slot strings like '08:00 AM', '08:40 AM', ...
-    """
     try:
         day = datetime.strptime(date_str_iso, "%Y-%m-%d").date()
     except Exception:
@@ -73,10 +67,6 @@ def generate_slots_for_date(date_str_iso):
 
 
 def slot_is_free(check_date_iso, candidate_slot_str, people, reservations_dict):
-    """
-    Return True if candidate_slot on check_date_iso is free for 'people' people.
-    A booking for N people occupies N consecutive slots starting at booked slot.
-    """
     slots = generate_slots_for_date(check_date_iso)
     try:
         candidate_index = slots.index(candidate_slot_str)
@@ -95,55 +85,46 @@ def slot_is_free(check_date_iso, candidate_slot_str, people, reservations_dict):
         try:
             other_index = slots.index(other_time)
         except Exception:
-            # if stored format differs, try normalization
             try:
                 other_index = slots.index(datetime.strptime(other_time, "%I:%M %p").strftime("%I:%M %p"))
             except Exception:
-                # unknown stored time — be conservative
                 return False
         other_end = other_index + other_people
-        # overlap?
         if not (needed_end <= other_index or candidate_index >= other_end):
             return False
 
     return True
 
+
 def recommend_slots(date_str_iso, time_str, people, reservations_dict):
     """
     Return list of (slot_str, date_iso) suggestions.
-    Behavior:
-      - Try to find free slots on the requested date first (even if it's tomorrow).
-      - If none found on that date, try next day.
-      - Returns list of tuples: (slot_str, date_iso).
+    Tries the requested date first, then the next day.
     """
-
-    # Parse date safely
     try:
         selected_date = datetime.strptime(date_str_iso, "%Y-%m-%d").date()
     except Exception:
         selected_date = datetime.now().date()
 
-    # Parse requested time robustly
     try:
         requested_time = datetime.strptime(time_str, "%I:%M %p").time()
     except Exception:
         requested_time = datetime.strptime(OPEN_TIME_STR, "%I:%M %p").time()
 
-    # If requested_time at/after close -> move to next day
     if requested_time >= dtime(20, 0):
         selected_date = selected_date + timedelta(days=1)
 
     results = []
     current_date_str = selected_date.strftime("%Y-%m-%d")
 
-    # 1) Try same requested date first
+    # same day
     for s in generate_slots_for_date(current_date_str):
         if slot_is_free(current_date_str, s, people, reservations_dict):
             results.append((s, current_date_str))
             if len(results) >= RECOMMEND_LIMIT:
                 break
 
-    # 2) If none, try next day
+    # next day
     if not results:
         next_day = selected_date + timedelta(days=1)
         next_day_str = next_day.strftime("%Y-%m-%d")
@@ -157,7 +138,7 @@ def recommend_slots(date_str_iso, time_str, people, reservations_dict):
 
 
 # -----------------------
-# UI helper: encode/decode slot for callback_data
+# UI helper
 # -----------------------
 def enc(s: str) -> str:
     return quote_plus(s)
@@ -166,37 +147,28 @@ def enc(s: str) -> str:
 def dec(s: str) -> str:
     return unquote_plus(s)
 
+
 def can_cancel_reservation(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Returns True if the user has an active reservation and more than 2 hours remain.
-    """
     res = context.user_data.get("active_reservation")
     if not res:
         return False
-
     try:
         dt = datetime.strptime(f"{res['date']} {res['time']}", "%Y-%m-%d %I:%M %p")
-        now = datetime.now()
-        diff = dt - now
-        return diff > timedelta(hours=2)
+        return (dt - datetime.now()) > timedelta(hours=2)
     except Exception:
         return False
 
-# -----------------------
-# Keyboards
-# -----------------------
+
 def home_keyboard(context=None):
     keyboard = [
         [InlineKeyboardButton("💈 Book Appointment", callback_data="book")],
         [InlineKeyboardButton("📖 My Bookings", callback_data="my_bookings")],
         [InlineKeyboardButton("❓ Help", callback_data="help")]
     ]
-
-    # Show cancel only if an active reservation exists
     if context and context.user_data.get("active_reservation"):
         keyboard.append([InlineKeyboardButton("❌ Cancel Reservation", callback_data="cancel_booking")])
-
     return InlineKeyboardMarkup(keyboard)
+
 
 def dates_keyboard():
     today = datetime.today()
@@ -214,17 +186,14 @@ def dates_keyboard():
     return InlineKeyboardMarkup(buttons)
 
 
-
 def times_keyboard(date_str_iso):
     slots = generate_slots_for_date(date_str_iso)
     rows = []
     row = []
     for i, s in enumerate(slots, start=1):
         if slot_is_free(date_str_iso, s, 1, reservations):
-            # free slot -> clickable
             row.append(InlineKeyboardButton(s, callback_data=f"time_{enc(s)}"))
         else:
-            # taken -> not clickable, show reserved label
             label = f"{s} ❌ (the spot has been reserved)"
             row.append(InlineKeyboardButton(label, callback_data=f"taken_{enc(s)}"))
         if i % 3 == 0:
@@ -248,21 +217,13 @@ def people_keyboard(count: int):
     ])
 
 
-def confirm_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_people"),
-         InlineKeyboardButton("✅ Confirm", callback_data="final_confirm")]
-    ])
-
 def add_cancel_button(markup: InlineKeyboardMarkup, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Appends a cancel reservation button to any existing markup if eligible.
-    """
     if can_cancel_reservation(context):
         new_inline = markup.inline_keyboard.copy()
         new_inline.append([InlineKeyboardButton("❌ Cancel Reservation", callback_data="cancel_booking")])
         return InlineKeyboardMarkup(new_inline)
     return markup
+
 
 # -----------------------
 # Handlers
@@ -292,7 +253,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_history = context.application.bot_data.get("booking_history", {})
         user_history = bot_history.get(user_id, []).copy()
 
-        # include active reservation if present
         active = reservations.get(user_id)
         if active:
             exists = any((r.get("date") == active.get("date") and r.get("time") == active.get("time")) for r in user_history)
@@ -306,7 +266,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "status": "Active"
                 })
 
-        # mark past actives as completed
         for b in user_history:
             try:
                 booking_dt = datetime.strptime(f"{b['date']} {b['time']}", "%Y-%m-%d %I:%M %p")
@@ -319,7 +278,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📖 You have no booking history.", reply_markup=home_keyboard(context))
             return
 
-        # sort by status then recent
         def sort_key(b):
             order = {"Active": 0, "Completed": 1, "Cancelled": 2}
             rank = order.get(b.get("status"), 3)
@@ -358,31 +316,31 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Help
     if data == "help":
         help_text = (
-        "💈 *MbBarber Shop Information*\n\n"
-        "ℹ️ *To book an appointment:*\n"
-        "Choose *Date → Time → How many people → Client name → Client phone number → Review → Confirm*\n\n"
-        "🏠 *Address:*\n"
-        "Bulbula 93, Zemen Bank — Yalebet building, Ground Floor\n\n"
-        "📞 *Phone:*\n"
-        "+251920224604\n"
-        "+251709576073\n\n"
-        "🎵 *TikTok:*\n"
-        "@MbBarberShop\n"
-        "https://www.tiktok.com/@mbbarbershop02?&t=ZM-91hMkvbC0Wv\n\n"
-        "📢 *Telegram:*\n"
-        "@MbBarberShop\n"
-        "https://t.me/mbbarbershop02\n\n"
-        "💬 If you have any issues or special requests, feel free to message us directly!"
-    )
+            "💈 *MbBarber Shop Information*\n\n"
+            "ℹ️ *To book an appointment:*\n"
+            "Choose *Date → Time → How many people → Client name → Client phone number → Review → Confirm*\n\n"
+            "🏠 *Address:*\n"
+            "Bulbula 93, Zemen Bank — Yalebet building, Ground Floor\n\n"
+            "📞 *Phone:*\n"
+            "+251920224604\n"
+            "+251709576073\n\n"
+            "🎵 *TikTok:*\n"
+            "@MbBarberShop\n"
+            "https://www.tiktok.com/@mbbarbershop02?&t=ZM-91hMkvbC0Wv\n\n"
+            "📢 *Telegram:*\n"
+            "@MbBarberShop\n"
+            "https://t.me/mbbarbershop02\n\n"
+            "💬 If you have any issues or special requests, feel free to message us directly!"
+        )
 
-    await query.edit_message_text(
-        help_text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏠 Home", callback_data="home")]
-        ])
-    )
-    return
+        await query.edit_message_text(
+            help_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Home", callback_data="home")]
+            ])
+        )
+        return
 
     # Home
     if data == "home":
@@ -713,24 +671,44 @@ async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
 
-def main():
-    app = Application.builder().token(TOKEN).build()
-    job_queue = app.job_queue  # ✅ this activates the JobQueue
-
+def register_handlers(app):
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    # ⏰ Schedule daily summary every morning at 7:00 AM
-    app.job_queue.run_daily(send_daily_summary, time=dtime(hour=7, minute=0))
 
-    logging.info("Bot started")
+def main():
+    app = Application.builder().token(TOKEN).build()
+    register_handlers(app)
+
+    # schedule daily summary if job_queue available
+    try:
+        app.job_queue.run_daily(send_daily_summary, time=dtime(hour=7, minute=0))
+    except Exception:
+        pass
+
+    logging.info("Bot started (polling)")
     app.run_polling()
 
-if __name__ == "__main__":
-    main()
 def main_webhook():
+    """
+    Build the application and run it in webhook mode (used by Render / web.py).
+    """
+    global application
+    application = Application.builder().token(TOKEN).build()
+    register_handlers(application)
+
+    # schedule daily summary (job queue)
+    try:
+        application.job_queue.run_daily(send_daily_summary, time=dtime(hour=7, minute=0))
+    except Exception:
+        pass
+
+    # Start webhook server (application.run_webhook will block until stopped)
     application.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-        webhook_url="https://barber-bot-new.onrender.com/webhook"
+        webhook_url=os.environ.get("WEBHOOK_URL", "https://barber-bot-new.onrender.com/webhook")
     )
+
+if __name__ == "__main__":
+    main()
